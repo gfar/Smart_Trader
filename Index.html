@@ -1,0 +1,2211 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Deriv AI Trader</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #020617; color: #e2e8f0; font-family: 'Inter', sans-serif; }
+    input, select, button { font-family: inherit; }
+    ::-webkit-scrollbar { width: 4px; height: 4px; }
+    ::-webkit-scrollbar-track { background: #0f172a; }
+    ::-webkit-scrollbar-thumb { background: #334155; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script>
+(function() {
+  "use strict";
+  const { useState, useEffect, useRef, useCallback } = React;
+
+
+// ─── CONSTANTS ────────────────────────────────────────────────────────────────
+const DERIV_WS_URL = "wss://ws.binaryws.com/websockets/v3?app_id=1089";
+const MARKETS = [{
+  id: "BOOM300N",
+  label: "Boom 300",
+  type: "boom",
+  color: "#10b981"
+}, {
+  id: "BOOM500",
+  label: "Boom 500",
+  type: "boom",
+  color: "#10b981"
+}, {
+  id: "BOOM1000",
+  label: "Boom 1000",
+  type: "boom",
+  color: "#10b981"
+}, {
+  id: "CRASH300N",
+  label: "Crash 300",
+  type: "crash",
+  color: "#ef4444"
+}, {
+  id: "CRASH500",
+  label: "Crash 500",
+  type: "crash",
+  color: "#ef4444"
+}, {
+  id: "CRASH1000",
+  label: "Crash 1000",
+  type: "crash",
+  color: "#ef4444"
+}, {
+  id: "R_10",
+  label: "Volatility 10",
+  type: "volatility",
+  color: "#6366f1"
+}, {
+  id: "R_25",
+  label: "Volatility 25",
+  type: "volatility",
+  color: "#6366f1"
+}, {
+  id: "R_50",
+  label: "Volatility 50",
+  type: "volatility",
+  color: "#6366f1"
+}, {
+  id: "R_75",
+  label: "Volatility 75",
+  type: "volatility",
+  color: "#6366f1"
+}, {
+  id: "R_100",
+  label: "Volatility 100",
+  type: "volatility",
+  color: "#6366f1"
+}];
+const TIMEFRAMES = ["M1", "M5", "M15", "H1", "H4"];
+const RISK_MODES = {
+  conservative: 1,
+  moderate: 2,
+  aggressive: 3
+};
+
+// ─── TECHNICAL ANALYSIS UTILITIES ────────────────────────────────────────────
+function calcEMA(data, period) {
+  if (!data || data.length < period) return [];
+  const k = 2 / (period + 1);
+  let ema = [data.slice(0, period).reduce((a, b) => a + b, 0) / period];
+  for (let i = period; i < data.length; i++) {
+    ema.push(data[i] * k + ema[ema.length - 1] * (1 - k));
+  }
+  return ema;
+}
+function calcRSI(closes, period = 14) {
+  if (!closes || closes.length < period + 1) return 50;
+  let gains = 0,
+    losses = 0;
+  for (let i = 1; i <= period; i++) {
+    const d = closes[i] - closes[i - 1];
+    if (d > 0) gains += d;else losses -= d;
+  }
+  let avgGain = gains / period,
+    avgLoss = losses / period;
+  for (let i = period + 1; i < closes.length; i++) {
+    const d = closes[i] - closes[i - 1];
+    avgGain = (avgGain * (period - 1) + Math.max(d, 0)) / period;
+    avgLoss = (avgLoss * (period - 1) + Math.max(-d, 0)) / period;
+  }
+  if (avgLoss === 0) return 100;
+  return 100 - 100 / (1 + avgGain / avgLoss);
+}
+function calcATR(highs, lows, closes, period = 14) {
+  if (!highs || highs.length < 2) return 0;
+  const tr = highs.map((h, i) => {
+    if (i === 0) return h - lows[i];
+    return Math.max(h - lows[i], Math.abs(h - closes[i - 1]), Math.abs(lows[i] - closes[i - 1]));
+  });
+  return tr.slice(-period).reduce((a, b) => a + b, 0) / period;
+}
+function calcBollingerBands(closes, period = 20, mult = 2) {
+  if (!closes || closes.length < period) return {
+    upper: 0,
+    mid: 0,
+    lower: 0
+  };
+  const slice = closes.slice(-period);
+  const mid = slice.reduce((a, b) => a + b, 0) / period;
+  const std = Math.sqrt(slice.reduce((a, b) => a + (b - mid) ** 2, 0) / period);
+  return {
+    upper: mid + mult * std,
+    mid,
+    lower: mid - mult * std
+  };
+}
+function calcMACD(closes) {
+  if (!closes || closes.length < 26) return {
+    macd: 0,
+    signal: 0,
+    hist: 0
+  };
+  const ema12 = calcEMA(closes, 12);
+  const ema26 = calcEMA(closes, 26);
+  const diff = ema26.length;
+  const macdLine = ema12.slice(-diff).map((v, i) => v - ema26[i]);
+  const signalLine = calcEMA(macdLine, 9);
+  const macd = macdLine[macdLine.length - 1] || 0;
+  const signal = signalLine[signalLine.length - 1] || 0;
+  return {
+    macd,
+    signal,
+    hist: macd - signal
+  };
+}
+
+// ─── SMC ANALYSIS ─────────────────────────────────────────────────────────────
+function detectSMC(candles) {
+  if (!candles || candles.length < 10) return {
+    bos: null,
+    choch: null,
+    orderBlocks: [],
+    fvgs: []
+  };
+  const highs = candles.map(c => c.high);
+  const lows = candles.map(c => c.low);
+  const n = candles.length;
+
+  // BOS / CHoCH detection (simplified)
+  const prevHigh = Math.max(...highs.slice(-6, -1));
+  const prevLow = Math.min(...lows.slice(-6, -1));
+  const lastClose = candles[n - 1].close;
+  const bos = lastClose > prevHigh ? "bullish" : lastClose < prevLow ? "bearish" : null;
+  const choch = !bos && candles[n - 1].close > candles[n - 3].high ? "bullish" : null;
+
+  // Order blocks (last significant up/down candle before a strong move)
+  const orderBlocks = [];
+  for (let i = 2; i < Math.min(n, 8); i++) {
+    const c = candles[n - 1 - i];
+    const next = candles[n - i];
+    if (next.close > c.high * 1.001) orderBlocks.push({
+      type: "bullish",
+      high: c.high,
+      low: c.low
+    });else if (next.close < c.low * 0.999) orderBlocks.push({
+      type: "bearish",
+      high: c.high,
+      low: c.low
+    });
+  }
+
+  // FVGs
+  const fvgs = [];
+  for (let i = 2; i < Math.min(n, 6); i++) {
+    const a = candles[n - 1 - i];
+    const c2 = candles[n - 1 - (i - 2)];
+    if (c2.low > a.high) fvgs.push({
+      type: "bullish",
+      top: c2.low,
+      bottom: a.high
+    });
+    if (c2.high < a.low) fvgs.push({
+      type: "bearish",
+      top: a.low,
+      bottom: c2.high
+    });
+  }
+  return {
+    bos,
+    choch,
+    orderBlocks,
+    fvgs
+  };
+}
+
+// ─── CONFIDENCE ENGINE ────────────────────────────────────────────────────────
+function generateSignal(candles, market) {
+  if (!candles || candles.length < 30) return null;
+  const closes = candles.map(c => c.close);
+  const highs = candles.map(c => c.high);
+  const lows = candles.map(c => c.low);
+  const rsi = calcRSI(closes);
+  const macd = calcMACD(closes);
+  const atr = calcATR(highs, lows, closes);
+  const bb = calcBollingerBands(closes);
+  const ema50 = calcEMA(closes, Math.min(50, closes.length));
+  const ema200 = calcEMA(closes, Math.min(200, closes.length));
+  const smc = detectSMC(candles);
+  const last = closes[closes.length - 1];
+  let score = 50;
+  const reasons = [];
+
+  // RSI
+  if (rsi < 35) {
+    score += 12;
+    reasons.push("RSI Oversold – Bullish Recovery");
+  } else if (rsi > 65) {
+    score -= 12;
+    reasons.push("RSI Overbought – Bearish Pressure");
+  }
+
+  // MACD
+  if (macd.hist > 0) {
+    score += 8;
+    reasons.push("MACD Bullish Momentum");
+  } else {
+    score -= 8;
+    reasons.push("MACD Bearish Momentum");
+  }
+
+  // Bollinger
+  if (last <= bb.lower) {
+    score += 10;
+    reasons.push("Price at Lower BB – Buy Zone");
+  } else if (last >= bb.upper) {
+    score -= 10;
+    reasons.push("Price at Upper BB – Sell Zone");
+  }
+
+  // EMA trend
+  const e50 = ema50[ema50.length - 1];
+  const e200 = ema200[ema200.length - 1];
+  if (e50 && e200) {
+    if (e50 > e200 && last > e50) {
+      score += 10;
+      reasons.push("Price Above EMA 50/200 – Uptrend");
+    }
+    if (e50 < e200 && last < e50) {
+      score -= 10;
+      reasons.push("Price Below EMA 50/200 – Downtrend");
+    }
+  }
+
+  // SMC
+  if (smc.bos === "bullish") {
+    score += 15;
+    reasons.push("Bullish BOS Confirmed");
+  }
+  if (smc.bos === "bearish") {
+    score -= 15;
+    reasons.push("Bearish BOS Confirmed");
+  }
+  if (smc.choch === "bullish") {
+    score += 10;
+    reasons.push("CHoCH – Structure Shift Bullish");
+  }
+  if (smc.orderBlocks.some(ob => ob.type === "bullish")) {
+    score += 8;
+    reasons.push("Bullish Order Block Retest");
+  }
+  if (smc.orderBlocks.some(ob => ob.type === "bearish")) {
+    score -= 8;
+    reasons.push("Bearish Order Block Formed");
+  }
+  if (smc.fvgs.some(f => f.type === "bullish")) {
+    score += 5;
+    reasons.push("Bullish FVG Present");
+  }
+
+  // Market-type bias
+  if (market.type === "boom" && rsi < 50) {
+    score += 5;
+    reasons.push("Boom Market Bias – Spike Expected");
+  }
+  if (market.type === "crash" && rsi > 50) {
+    score += 5;
+    reasons.push("Crash Market Bias – Drop Expected");
+  }
+  const direction = score > 55 ? "BUY" : score < 45 ? "SELL" : "WAIT";
+  const confidence = Math.min(98, Math.max(40, Math.abs(score - 50) * 2.2 + 40));
+  const risk = confidence > 80 ? "Low" : confidence > 65 ? "Medium" : "High";
+  return {
+    direction,
+    confidence: Math.round(confidence),
+    reasons: reasons.slice(0, 5),
+    rsi: Math.round(rsi),
+    macd,
+    atr: atr.toFixed(5),
+    bb,
+    smc,
+    risk,
+    marketBias: score > 55 ? "Bullish" : score < 45 ? "Bearish" : "Neutral",
+    timestamp: new Date()
+  };
+}
+
+// ─── LOT SIZE CALCULATOR ──────────────────────────────────────────────────────
+function calcLotSize(balance, riskPct, atr, direction) {
+  const riskAmount = balance * riskPct / 100;
+  const slPips = atr ? parseFloat(atr) * 1.5 : balance * 0.003;
+  const lotSize = Math.max(0.01, riskAmount / (slPips * 10000)).toFixed(2);
+  const sl = direction === "BUY" ? (-(slPips * 10000)).toFixed(0) + " pips" : (+(slPips * 10000)).toFixed(0) + " pips";
+  const tp = direction === "BUY" ? (+(slPips * 20000)).toFixed(0) + " pips" : (-(slPips * 20000)).toFixed(0) + " pips";
+  return {
+    lotSize,
+    riskAmount: riskAmount.toFixed(2),
+    sl,
+    tp
+  };
+}
+
+// ─── PRICE CHART (CANVAS) ─────────────────────────────────────────────────────
+function MiniChart({
+  candles,
+  color
+}) {
+  const ref = useRef();
+  useEffect(() => {
+    const canvas = ref.current;
+    if (!canvas || !candles || candles.length < 2) return;
+    const ctx = canvas.getContext("2d");
+    const w = canvas.width,
+      h = canvas.height;
+    ctx.clearRect(0, 0, w, h);
+    const closes = candles.map(c => c.close);
+    const min = Math.min(...closes),
+      max = Math.max(...closes);
+    const range = max - min || 1;
+    ctx.beginPath();
+    closes.forEach((v, i) => {
+      const x = i / (closes.length - 1) * w;
+      const y = h - (v - min) / range * h;
+      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    });
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+    // Fill
+    ctx.lineTo(w, h);
+    ctx.lineTo(0, h);
+    ctx.closePath();
+    ctx.fillStyle = color + "22";
+    ctx.fill();
+  }, [candles, color]);
+  return /*#__PURE__*/React.createElement("canvas", {
+    ref: ref,
+    width: 120,
+    height: 40,
+    style: {
+      display: "block"
+    }
+  });
+}
+
+// ─── SPARKLINE ────────────────────────────────────────────────────────────────
+function Sparkline({
+  data,
+  color = "#10b981"
+}) {
+  if (!data || data.length < 2) return /*#__PURE__*/React.createElement("div", {
+    style: {
+      height: 32
+    }
+  });
+  const min = Math.min(...data),
+    max = Math.max(...data),
+    range = max - min || 1;
+  const pts = data.map((v, i) => `${i / (data.length - 1) * 100},${100 - (v - min) / range * 100}`).join(" ");
+  return /*#__PURE__*/React.createElement("svg", {
+    viewBox: "0 0 100 100",
+    preserveAspectRatio: "none",
+    style: {
+      width: "100%",
+      height: 32
+    }
+  }, /*#__PURE__*/React.createElement("polyline", {
+    points: pts,
+    fill: "none",
+    stroke: color,
+    strokeWidth: "3"
+  }));
+}
+
+// ─── CONFIDENCE RING ──────────────────────────────────────────────────────────
+function ConfidenceRing({
+  value,
+  label
+}) {
+  const r = 36,
+    circ = 2 * Math.PI * r;
+  const dash = value / 100 * circ;
+  const col = value >= 75 ? "#10b981" : value >= 60 ? "#f59e0b" : "#ef4444";
+  return /*#__PURE__*/React.createElement("svg", {
+    width: 90,
+    height: 90,
+    viewBox: "0 0 90 90"
+  }, /*#__PURE__*/React.createElement("circle", {
+    cx: 45,
+    cy: 45,
+    r: r,
+    fill: "none",
+    stroke: "#1e293b",
+    strokeWidth: 8
+  }), /*#__PURE__*/React.createElement("circle", {
+    cx: 45,
+    cy: 45,
+    r: r,
+    fill: "none",
+    stroke: col,
+    strokeWidth: 8,
+    strokeDasharray: `${dash} ${circ - dash}`,
+    strokeLinecap: "round",
+    transform: "rotate(-90 45 45)"
+  }), /*#__PURE__*/React.createElement("text", {
+    x: 45,
+    y: 42,
+    textAnchor: "middle",
+    fill: col,
+    fontSize: 14,
+    fontWeight: "700"
+  }, value, "%"), /*#__PURE__*/React.createElement("text", {
+    x: 45,
+    y: 56,
+    textAnchor: "middle",
+    fill: "#94a3b8",
+    fontSize: 8
+  }, label));
+}
+
+// ─── MAIN APP ─────────────────────────────────────────────────────────────────
+function DerivAITrader() {
+  const [tab, setTab] = useState("dashboard");
+  const [apiToken, setApiToken] = useState("");
+  const [tokenInput, setTokenInput] = useState("");
+  const [connected, setConnected] = useState(false);
+  const [connecting, setConnecting] = useState(false);
+  const [account, setAccount] = useState(null);
+  const [balance, setBalance] = useState(null);
+  const [openPos, setOpenPos] = useState([]);
+  const [tradeHistory, setTradeHistory] = useState([]);
+  const [signals, setSignals] = useState({});
+  const [selectedMarket, setSelectedMarket] = useState(MARKETS[2]);
+  const [candles, setCandles] = useState({});
+  const [livePrice, setLivePrice] = useState({});
+  const [riskMode, setRiskMode] = useState("moderate");
+  const [tradeMode, setTradeMode] = useState("signal");
+  const [autoTrading, setAutoTrading] = useState(false);
+  const [notifications, setNotifications] = useState([]);
+  const [dailyPnl, setDailyPnl] = useState(0);
+  const [equityCurve, setEquityCurve] = useState([]);
+  const [wsReady, setWsReady] = useState(false);
+  const [pendingTrade, setPendingTrade] = useState(null);
+  const [journal, setJournal] = useState([]);
+  const [analyzing, setAnalyzing] = useState(false);
+  const [winRate, setWinRate] = useState(0);
+  const [lossSeries, setLossSeries] = useState(0);
+  const wsRef = useRef(null);
+  const reqId = useRef(1);
+  const pendingReqs = useRef({});
+
+  // ── WebSocket Connection ──────────────────────────────────────────────────
+  const sendWS = useCallback(payload => {
+    return new Promise((resolve, reject) => {
+      if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+        reject(new Error("WebSocket not open"));
+        return;
+      }
+      const id = reqId.current++;
+      payload.req_id = id;
+      pendingReqs.current[id] = {
+        resolve,
+        reject
+      };
+      wsRef.current.send(JSON.stringify(payload));
+      setTimeout(() => {
+        if (pendingReqs.current[id]) {
+          delete pendingReqs.current[id];
+          reject(new Error("Request timed out"));
+        }
+      }, 15000);
+    });
+  }, []);
+  const connectWS = useCallback(() => {
+    return new Promise((resolve, reject) => {
+      const ws = new WebSocket(DERIV_WS_URL);
+      wsRef.current = ws;
+      ws.onopen = () => {
+        setWsReady(true);
+        resolve(ws);
+      };
+      ws.onerror = () => reject(new Error("WebSocket connection failed"));
+      ws.onclose = () => {
+        setWsReady(false);
+        setConnected(false);
+      };
+      ws.onmessage = evt => {
+        try {
+          const msg = JSON.parse(evt.data);
+          const reqId2 = msg.req_id;
+          if (reqId2 && pendingReqs.current[reqId2]) {
+            const {
+              resolve: res,
+              reject: rej
+            } = pendingReqs.current[reqId2];
+            delete pendingReqs.current[reqId2];
+            if (msg.error) rej(new Error(msg.error.message));else res(msg);
+          }
+          // Live tick stream
+          if (msg.tick) {
+            const {
+              symbol,
+              quote
+            } = msg.tick;
+            setLivePrice(prev => ({
+              ...prev,
+              [symbol]: quote
+            }));
+          }
+          // Balance updates
+          if (msg.balance) {
+            setBalance(msg.balance.balance);
+            setEquityCurve(prev => [...prev.slice(-49), msg.balance.balance]);
+          }
+          // Open contracts stream
+          if (msg.proposal_open_contract) {
+            const c = msg.proposal_open_contract;
+            setOpenPos(prev => {
+              const idx = prev.findIndex(p => p.contract_id === c.contract_id);
+              if (idx >= 0) {
+                const n = [...prev];
+                n[idx] = c;
+                return n;
+              }
+              return [...prev, c];
+            });
+          }
+        } catch (_) {}
+      };
+    });
+  }, []);
+
+  // ── Login ─────────────────────────────────────────────────────────────────
+  const login = useCallback(async () => {
+    if (!tokenInput.trim()) return;
+    setConnecting(true);
+    addNotif("Connecting to Deriv…", "info");
+    try {
+      await connectWS();
+      const auth = await sendWS({
+        authorize: tokenInput.trim()
+      });
+      const acct = auth.authorize;
+      setAccount(acct);
+      setApiToken(tokenInput.trim());
+      setConnected(true);
+      // Get balance
+      await sendWS({
+        balance: 1,
+        subscribe: 1
+      });
+      // Open contracts
+      try {
+        await sendWS({
+          portfolio: 1
+        });
+      } catch (_) {}
+      // Trade history
+      try {
+        const hist = await sendWS({
+          profit_table: 1,
+          limit: 20,
+          sort: "DESC"
+        });
+        if (hist.profit_table?.transactions) {
+          setTradeHistory(hist.profit_table.transactions);
+          const wins = hist.profit_table.transactions.filter(t => t.sell_price > t.buy_price).length;
+          setWinRate(Math.round(wins / hist.profit_table.transactions.length * 100) || 0);
+        }
+      } catch (_) {}
+      addNotif(`✅ Connected as ${acct.loginid}`, "success");
+      // Subscribe to ticks for all markets
+      MARKETS.forEach(m => {
+        try {
+          sendWS({
+            ticks: m.id,
+            subscribe: 1
+          });
+        } catch (_) {}
+      });
+      // Start analysis
+      startAnalysis();
+    } catch (e) {
+      addNotif(`❌ ${e.message}`, "error");
+    }
+    setConnecting(false);
+  }, [tokenInput, connectWS, sendWS]);
+  const disconnect = useCallback(() => {
+    if (wsRef.current) wsRef.current.close();
+    setConnected(false);
+    setAccount(null);
+    setBalance(null);
+    setApiToken("");
+    setSignals({});
+    setOpenPos([]);
+    addNotif("Disconnected from Deriv", "info");
+  }, []);
+
+  // ── Fetch Candles ─────────────────────────────────────────────────────────
+  const fetchCandles = useCallback(async symbol => {
+    try {
+      const res = await sendWS({
+        ticks_history: symbol,
+        count: 200,
+        end: "latest",
+        granularity: 60,
+        style: "candles"
+      });
+      if (res.candles) {
+        setCandles(prev => ({
+          ...prev,
+          [symbol]: res.candles
+        }));
+        return res.candles;
+      }
+    } catch (_) {}
+    return null;
+  }, [sendWS]);
+
+  // ── Analysis Loop ─────────────────────────────────────────────────────────
+  const startAnalysis = useCallback(async () => {
+    setAnalyzing(true);
+    for (const market of MARKETS) {
+      try {
+        const c = await fetchCandles(market.id);
+        if (c && c.length > 30) {
+          const sig = generateSignal(c, market);
+          if (sig) {
+            setSignals(prev => ({
+              ...prev,
+              [market.id]: sig
+            }));
+            if (sig.confidence >= 80 && sig.direction !== "WAIT") {
+              addNotif(`🔔 ${market.label}: ${sig.direction} ${sig.confidence}% confidence`, "signal");
+            }
+          }
+        }
+      } catch (_) {}
+    }
+    setAnalyzing(false);
+  }, [fetchCandles]);
+
+  // Re-analyze every 30s
+  useEffect(() => {
+    if (!connected) return;
+    const t = setInterval(startAnalysis, 30000);
+    return () => clearInterval(t);
+  }, [connected, startAnalysis]);
+
+  // ── Trade Execution ───────────────────────────────────────────────────────
+  const executeTrade = useCallback(async (market, signal, lotSize) => {
+    if (!connected || !wsRef.current) return;
+    addNotif(`⚡ Placing ${signal.direction} on ${market.label}…`, "info");
+    try {
+      // Get proposal
+      const contractType = signal.direction === "BUY" ? "CALL" : "PUT";
+      const proposal = await sendWS({
+        proposal: 1,
+        amount: parseFloat(lotSize) * 10,
+        basis: "stake",
+        contract_type: contractType,
+        currency: account?.currency || "USD",
+        duration: 5,
+        duration_unit: "m",
+        symbol: market.id
+      });
+      if (proposal.proposal?.id) {
+        const buy = await sendWS({
+          buy: proposal.proposal.id,
+          price: proposal.proposal.ask_price
+        });
+        if (buy.buy) {
+          addNotif(`✅ Trade placed! Contract: ${buy.buy.contract_id}`, "success");
+          const entry = {
+            id: buy.buy.contract_id,
+            market: market.label,
+            direction: signal.direction,
+            confidence: signal.confidence,
+            lot: lotSize,
+            time: new Date().toISOString(),
+            status: "open"
+          };
+          setJournal(prev => [entry, ...prev]);
+          setLossSeries(0);
+        }
+      }
+    } catch (e) {
+      addNotif(`❌ Trade failed: ${e.message}`, "error");
+      setLossSeries(prev => prev + 1);
+    }
+  }, [connected, sendWS, account]);
+  const handleSignalAction = useCallback((market, signal) => {
+    const bal = balance || 1000;
+    const {
+      lotSize
+    } = calcLotSize(bal, RISK_MODES[riskMode], signal.atr, signal.direction);
+    if (tradeMode === "signal") {
+      addNotif(`Signal: ${market.label} ${signal.direction} @ ${signal.confidence}%`, "signal");
+    } else if (tradeMode === "semi") {
+      setPendingTrade({
+        market,
+        signal,
+        lotSize
+      });
+    } else if (tradeMode === "auto" && autoTrading) {
+      if (lossSeries >= 3) {
+        addNotif("🛑 Auto-trading paused: 3 consecutive losses", "error");
+        return;
+      }
+      executeTrade(market, signal, lotSize);
+    }
+  }, [balance, riskMode, tradeMode, autoTrading, lossSeries, executeTrade]);
+
+  // ── Notifications ─────────────────────────────────────────────────────────
+  const addNotif = (msg, type = "info") => {
+    const id = Date.now();
+    setNotifications(prev => [{
+      id,
+      msg,
+      type,
+      time: new Date()
+    }, ...prev.slice(0, 29)]);
+  };
+
+  // ─── RENDER ───────────────────────────────────────────────────────────────
+  const TABS = [{
+    id: "dashboard",
+    label: "Dashboard",
+    icon: "⬡"
+  }, {
+    id: "markets",
+    label: "Markets",
+    icon: "📊"
+  }, {
+    id: "signals",
+    label: "AI Signals",
+    icon: "🧠"
+  }, {
+    id: "positions",
+    label: "Positions",
+    icon: "📂"
+  }, {
+    id: "journal",
+    label: "Journal",
+    icon: "📓"
+  }, {
+    id: "analytics",
+    label: "Analytics",
+    icon: "📈"
+  }, {
+    id: "settings",
+    label: "Settings",
+    icon: "⚙"
+  }];
+  const s = {
+    // CSS-in-JS helpers
+    card: {
+      background: "#0f172a",
+      border: "1px solid #1e293b",
+      borderRadius: 12,
+      padding: "20px",
+      marginBottom: 16
+    },
+    badge: col => ({
+      display: "inline-block",
+      padding: "2px 10px",
+      borderRadius: 20,
+      fontSize: 11,
+      fontWeight: 700,
+      background: col + "22",
+      color: col,
+      border: `1px solid ${col}44`
+    }),
+    btn: (col = "#6366f1", ghost = false) => ({
+      padding: "9px 18px",
+      borderRadius: 8,
+      border: ghost ? `1px solid ${col}` : "none",
+      background: ghost ? "transparent" : col,
+      color: ghost ? col : "#fff",
+      fontWeight: 600,
+      fontSize: 13,
+      cursor: "pointer"
+    }),
+    input: {
+      background: "#1e293b",
+      border: "1px solid #334155",
+      borderRadius: 8,
+      padding: "10px 14px",
+      color: "#e2e8f0",
+      fontSize: 13,
+      width: "100%",
+      outline: "none"
+    },
+    row: {
+      display: "flex",
+      gap: 12,
+      flexWrap: "wrap"
+    },
+    stat: (col = "#6366f1") => ({
+      flex: 1,
+      minWidth: 140,
+      background: "#0f172a",
+      border: `1px solid ${col}33`,
+      borderRadius: 10,
+      padding: "16px"
+    })
+  };
+
+  // ─── LOGIN SCREEN ──────────────────────────────────────────────────────────
+  if (!connected) {
+    return /*#__PURE__*/React.createElement("div", {
+      style: {
+        minHeight: "100vh",
+        background: "#020617",
+        color: "#e2e8f0",
+        fontFamily: "'Inter',sans-serif",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center"
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        width: "100%",
+        maxWidth: 460,
+        padding: 24
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        textAlign: "center",
+        marginBottom: 40
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 48,
+        marginBottom: 8
+      }
+    }, "⬡"), /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 26,
+        fontWeight: 800,
+        letterSpacing: -1,
+        color: "#e2e8f0"
+      }
+    }, "Deriv ", /*#__PURE__*/React.createElement("span", {
+      style: {
+        color: "#6366f1"
+      }
+    }, "AI"), " Trader"), /*#__PURE__*/React.createElement("div", {
+      style: {
+        color: "#64748b",
+        fontSize: 13,
+        marginTop: 6
+      }
+    }, "Intelligent synthetic indices trading platform")), /*#__PURE__*/React.createElement("div", {
+      style: s.card
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        marginBottom: 20
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 11,
+        color: "#94a3b8",
+        marginBottom: 6,
+        fontWeight: 600,
+        textTransform: "uppercase",
+        letterSpacing: 1
+      }
+    }, "Deriv API Token"), /*#__PURE__*/React.createElement("input", {
+      style: s.input,
+      type: "password",
+      placeholder: "Enter your Deriv API token…",
+      value: tokenInput,
+      onChange: e => setTokenInput(e.target.value),
+      onKeyDown: e => e.key === "Enter" && login()
+    }), /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 11,
+        color: "#475569",
+        marginTop: 6
+      }
+    }, "Get your token at ", /*#__PURE__*/React.createElement("span", {
+      style: {
+        color: "#6366f1"
+      }
+    }, "app.deriv.com → Account Settings → API Token"), ". Requires \"Trade\" + \"Read\" scopes.")), /*#__PURE__*/React.createElement("button", {
+      style: {
+        ...s.btn("#6366f1"),
+        width: "100%",
+        padding: "12px",
+        fontSize: 14,
+        opacity: connecting ? 0.6 : 1
+      },
+      onClick: login,
+      disabled: connecting
+    }, connecting ? "Connecting…" : "Connect to Deriv Account")), notifications.slice(0, 3).map(n => /*#__PURE__*/React.createElement("div", {
+      key: n.id,
+      style: {
+        padding: "10px 14px",
+        borderRadius: 8,
+        marginBottom: 8,
+        fontSize: 12,
+        background: n.type === "error" ? "#450a0a" : n.type === "success" ? "#052e16" : "#0f172a",
+        border: `1px solid ${n.type === "error" ? "#ef4444" : n.type === "success" ? "#10b981" : "#334155"}`,
+        color: n.type === "error" ? "#fca5a5" : n.type === "success" ? "#6ee7b7" : "#94a3b8"
+      }
+    }, n.msg)), /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: "grid",
+        gridTemplateColumns: "1fr 1fr 1fr",
+        gap: 10,
+        marginTop: 24
+      }
+    }, [["Smart Money", "BOS, CHoCH, Order Blocks, FVGs", "🧠"], ["Auto Risk Mgmt", "Dynamic SL/TP, Trailing Stop, Daily limits", "🛡"], ["Live Analysis", "M1–H4 multi-timeframe, 11 markets", "📡"]].map(([t, d, ic]) => /*#__PURE__*/React.createElement("div", {
+      key: t,
+      style: {
+        background: "#0f172a",
+        border: "1px solid #1e293b",
+        borderRadius: 10,
+        padding: 14,
+        textAlign: "center"
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 22,
+        marginBottom: 6
+      }
+    }, ic), /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 11,
+        fontWeight: 700,
+        color: "#e2e8f0",
+        marginBottom: 4
+      }
+    }, t), /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 10,
+        color: "#475569"
+      }
+    }, d))))));
+  }
+
+  // ─── MAIN PLATFORM ────────────────────────────────────────────────────────
+  const topSignals = MARKETS.map(m => ({
+    market: m,
+    sig: signals[m.id]
+  })).filter(x => x.sig && x.sig.confidence >= 70 && x.sig.direction !== "WAIT").sort((a, b) => b.sig.confidence - a.sig.confidence);
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      minHeight: "100vh",
+      background: "#020617",
+      color: "#e2e8f0",
+      fontFamily: "'Inter',sans-serif"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      background: "#0a0f1e",
+      borderBottom: "1px solid #1e293b",
+      padding: "0 20px",
+      display: "flex",
+      alignItems: "center",
+      gap: 12,
+      position: "sticky",
+      top: 0,
+      zIndex: 100
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 18,
+      fontWeight: 800,
+      color: "#e2e8f0",
+      padding: "14px 0",
+      marginRight: 16
+    }
+  }, "⬡ Deriv ", /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: "#6366f1"
+    }
+  }, "AI")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 2,
+      flex: 1,
+      overflowX: "auto"
+    }
+  }, TABS.map(t => /*#__PURE__*/React.createElement("button", {
+    key: t.id,
+    onClick: () => setTab(t.id),
+    style: {
+      padding: "14px 14px",
+      border: "none",
+      background: "transparent",
+      color: tab === t.id ? "#6366f1" : "#64748b",
+      fontWeight: tab === t.id ? 700 : 500,
+      fontSize: 12,
+      cursor: "pointer",
+      borderBottom: tab === t.id ? "2px solid #6366f1" : "2px solid transparent",
+      whiteSpace: "nowrap"
+    }
+  }, t.icon, " ", t.label))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      alignItems: "center",
+      gap: 10
+    }
+  }, autoTrading && /*#__PURE__*/React.createElement("span", {
+    style: s.badge("#10b981")
+  }, "AUTO ON"), analyzing && /*#__PURE__*/React.createElement("span", {
+    style: s.badge("#f59e0b")
+  }, "ANALYZING…"), /*#__PURE__*/React.createElement("span", {
+    style: s.badge("#10b981")
+  }, "● ", account?.loginid), /*#__PURE__*/React.createElement("button", {
+    style: s.btn("#ef4444", true),
+    onClick: disconnect
+  }, "Disconnect"))), pendingTrade && /*#__PURE__*/React.createElement("div", {
+    style: {
+      position: "fixed",
+      inset: 0,
+      background: "#00000088",
+      zIndex: 200,
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "center"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      ...s.card,
+      width: 380,
+      margin: 0
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 16,
+      fontWeight: 700,
+      marginBottom: 16
+    }
+  }, "Confirm Trade"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginBottom: 12
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: s.badge(pendingTrade.signal.direction === "BUY" ? "#10b981" : "#ef4444")
+  }, pendingTrade.signal.direction), /*#__PURE__*/React.createElement("span", {
+    style: {
+      marginLeft: 8,
+      fontWeight: 600
+    }
+  }, pendingTrade.market.label)), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: "#94a3b8",
+      marginBottom: 16
+    }
+  }, "Confidence: ", pendingTrade.signal.confidence, "% · Lot: ", pendingTrade.lotSize, " · Risk: $", pendingTrade.lotSize * 10), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 10
+    }
+  }, /*#__PURE__*/React.createElement("button", {
+    style: {
+      ...s.btn("#10b981"),
+      flex: 1
+    },
+    onClick: () => {
+      executeTrade(pendingTrade.market, pendingTrade.signal, pendingTrade.lotSize);
+      setPendingTrade(null);
+    }
+  }, "✅ Execute Trade"), /*#__PURE__*/React.createElement("button", {
+    style: {
+      ...s.btn("#ef4444", true),
+      flex: 1
+    },
+    onClick: () => setPendingTrade(null)
+  }, "Cancel")))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      maxWidth: 1280,
+      margin: "0 auto",
+      padding: "20px"
+    }
+  }, tab === "dashboard" && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+    style: s.row
+  }, [{
+    label: "Balance",
+    value: `${account?.currency} ${balance?.toFixed(2) ?? "—"}`,
+    sub: "Available",
+    col: "#6366f1"
+  }, {
+    label: "Equity",
+    value: `${account?.currency} ${(balance ?? 0).toFixed(2)}`,
+    sub: "Current",
+    col: "#10b981"
+  }, {
+    label: "Daily P&L",
+    value: `${dailyPnl >= 0 ? "+" : ""}${dailyPnl.toFixed(2)}`,
+    sub: "Today",
+    col: dailyPnl >= 0 ? "#10b981" : "#ef4444"
+  }, {
+    label: "Win Rate",
+    value: `${winRate}%`,
+    sub: `${tradeHistory.length} trades`,
+    col: "#f59e0b"
+  }, {
+    label: "Open Pos",
+    value: openPos.length,
+    sub: "Live contracts",
+    col: "#a78bfa"
+  }].map(item => /*#__PURE__*/React.createElement("div", {
+    key: item.label,
+    style: s.stat(item.col)
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: "#64748b",
+      fontWeight: 600,
+      textTransform: "uppercase",
+      letterSpacing: 1,
+      marginBottom: 8
+    }
+  }, item.label), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 22,
+      fontWeight: 800,
+      color: item.col
+    }
+  }, item.value), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: "#475569",
+      marginTop: 4
+    }
+  }, item.sub)))), /*#__PURE__*/React.createElement("div", {
+    style: s.card
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      justifyContent: "space-between",
+      alignItems: "center",
+      marginBottom: 16
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontWeight: 700,
+      fontSize: 15
+    }
+  }, "🧠 Top AI Signals"), /*#__PURE__*/React.createElement("button", {
+    style: s.btn("#6366f1", true),
+    onClick: startAnalysis,
+    disabled: analyzing
+  }, analyzing ? "Analyzing…" : "Re-Analyze All")), topSignals.length === 0 ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      textAlign: "center",
+      color: "#475569",
+      padding: "32px 0"
+    }
+  }, analyzing ? "Analyzing markets…" : "No high-confidence signals yet. Click Re-Analyze.") : /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gridTemplateColumns: "repeat(auto-fill,minmax(300px,1fr))",
+      gap: 12
+    }
+  }, topSignals.slice(0, 6).map(({
+    market,
+    sig
+  }) => /*#__PURE__*/React.createElement("div", {
+    key: market.id,
+    style: {
+      background: "#080d1a",
+      border: `1px solid ${sig.direction === "BUY" ? "#10b98133" : "#ef444433"}`,
+      borderRadius: 10,
+      padding: 16
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      justifyContent: "space-between",
+      alignItems: "flex-start",
+      marginBottom: 10
+    }
+  }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontWeight: 700,
+      fontSize: 13
+    }
+  }, market.label), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: "#475569"
+    }
+  }, livePrice[market.id]?.toFixed(4) ?? "—")), /*#__PURE__*/React.createElement(ConfidenceRing, {
+    value: sig.confidence,
+    label: sig.direction
+  })), /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginBottom: 10
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: s.badge(sig.direction === "BUY" ? "#10b981" : "#ef4444")
+  }, sig.direction), /*#__PURE__*/React.createElement("span", {
+    style: {
+      ...s.badge("#94a3b8"),
+      marginLeft: 6
+    }
+  }, sig.marketBias), /*#__PURE__*/React.createElement("span", {
+    style: {
+      ...s.badge(sig.risk === "Low" ? "#10b981" : sig.risk === "Medium" ? "#f59e0b" : "#ef4444"),
+      marginLeft: 6
+    }
+  }, "Risk: ", sig.risk)), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: "#64748b",
+      marginBottom: 12
+    }
+  }, sig.reasons.slice(0, 3).map((r, i) => /*#__PURE__*/React.createElement("div", {
+    key: i
+  }, "• ", r))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 8
+    }
+  }, /*#__PURE__*/React.createElement("button", {
+    style: {
+      ...s.btn(sig.direction === "BUY" ? "#10b981" : "#ef4444"),
+      fontSize: 12,
+      padding: "6px 12px"
+    },
+    onClick: () => handleSignalAction(market, sig)
+  }, tradeMode === "signal" ? "View Signal" : tradeMode === "semi" ? "Place Trade" : "Auto Trade"), /*#__PURE__*/React.createElement("button", {
+    style: {
+      ...s.btn("#6366f1", true),
+      fontSize: 12,
+      padding: "6px 12px"
+    },
+    onClick: () => {
+      setSelectedMarket(market);
+      setTab("signals");
+    }
+  }, "Full Analysis")))))), /*#__PURE__*/React.createElement("div", {
+    style: s.card
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontWeight: 700,
+      fontSize: 15,
+      marginBottom: 12
+    }
+  }, "📈 Equity Curve"), equityCurve.length > 1 ? /*#__PURE__*/React.createElement(Sparkline, {
+    data: equityCurve,
+    color: "#6366f1"
+  }) : /*#__PURE__*/React.createElement("div", {
+    style: {
+      color: "#475569",
+      fontSize: 12,
+      padding: "20px 0"
+    }
+  }, "Equity data will appear as the account streams balance updates.")), /*#__PURE__*/React.createElement("div", {
+    style: s.card
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontWeight: 700,
+      fontSize: 15,
+      marginBottom: 12
+    }
+  }, "🔔 Activity Feed"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      maxHeight: 220,
+      overflowY: "auto"
+    }
+  }, notifications.length === 0 ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      color: "#475569",
+      fontSize: 12
+    }
+  }, "No activity yet.") : notifications.map(n => /*#__PURE__*/React.createElement("div", {
+    key: n.id,
+    style: {
+      padding: "8px 0",
+      borderBottom: "1px solid #0f172a",
+      display: "flex",
+      gap: 10,
+      fontSize: 12
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: n.type === "error" ? "#ef4444" : n.type === "success" ? "#10b981" : n.type === "signal" ? "#f59e0b" : "#94a3b8"
+    }
+  }, "●"), /*#__PURE__*/React.createElement("span", {
+    style: {
+      flex: 1,
+      color: "#94a3b8"
+    }
+  }, n.msg), /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: "#334155"
+    }
+  }, n.time.toLocaleTimeString())))))), tab === "markets" && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontWeight: 700,
+      fontSize: 17,
+      marginBottom: 16
+    }
+  }, "📊 Market Overview"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gridTemplateColumns: "repeat(auto-fill,minmax(240px,1fr))",
+      gap: 12
+    }
+  }, MARKETS.map(m => {
+    const sig = signals[m.id];
+    const price = livePrice[m.id];
+    const c = candles[m.id];
+    return /*#__PURE__*/React.createElement("div", {
+      key: m.id,
+      style: {
+        ...s.card,
+        margin: 0,
+        cursor: "pointer",
+        border: selectedMarket.id === m.id ? `1px solid ${m.color}` : "1px solid #1e293b"
+      },
+      onClick: () => {
+        setSelectedMarket(m);
+        setTab("signals");
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: "flex",
+        justifyContent: "space-between",
+        marginBottom: 8
+      }
+    }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontWeight: 700,
+        fontSize: 13
+      }
+    }, m.label), /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 11,
+        color: "#475569"
+      }
+    }, m.id)), sig && /*#__PURE__*/React.createElement("span", {
+      style: s.badge(sig.direction === "BUY" ? "#10b981" : sig.direction === "SELL" ? "#ef4444" : "#64748b")
+    }, sig.direction)), /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 20,
+        fontWeight: 800,
+        color: m.color,
+        marginBottom: 6
+      }
+    }, price ? price.toFixed(m.id.startsWith("R_") ? 2 : 4) : "—"), /*#__PURE__*/React.createElement(MiniChart, {
+      candles: c,
+      color: m.color
+    }), sig && /*#__PURE__*/React.createElement("div", {
+      style: {
+        marginTop: 8,
+        display: "flex",
+        gap: 6
+      }
+    }, /*#__PURE__*/React.createElement("span", {
+      style: s.badge("#6366f1")
+    }, "RSI ", sig.rsi), /*#__PURE__*/React.createElement("span", {
+      style: s.badge(sig.risk === "Low" ? "#10b981" : sig.risk === "Medium" ? "#f59e0b" : "#ef4444")
+    }, sig.confidence, "%")));
+  }))), tab === "signals" && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 12,
+      marginBottom: 16,
+      flexWrap: "wrap",
+      alignItems: "center"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontWeight: 700,
+      fontSize: 17
+    }
+  }, "🧠 AI Signal Engine"), /*#__PURE__*/React.createElement("select", {
+    style: {
+      ...s.input,
+      width: 180
+    },
+    value: selectedMarket.id,
+    onChange: e => setSelectedMarket(MARKETS.find(m => m.id === e.target.value))
+  }, MARKETS.map(m => /*#__PURE__*/React.createElement("option", {
+    key: m.id,
+    value: m.id
+  }, m.label))), /*#__PURE__*/React.createElement("button", {
+    style: s.btn("#6366f1"),
+    onClick: () => fetchCandles(selectedMarket.id).then(() => startAnalysis())
+  }, "Analyze ", selectedMarket.label)), (() => {
+    const sig = signals[selectedMarket.id];
+    const c = candles[selectedMarket.id];
+    const bal = balance || 1000;
+    const lot = sig ? calcLotSize(bal, RISK_MODES[riskMode], sig.atr, sig.direction) : null;
+    return /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: "grid",
+        gridTemplateColumns: "1fr 1fr",
+        gap: 16
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      style: s.card
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontWeight: 700,
+        marginBottom: 16
+      }
+    }, "Signal: ", selectedMarket.label), sig ? /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+      style: {
+        textAlign: "center",
+        marginBottom: 20
+      }
+    }, /*#__PURE__*/React.createElement(ConfidenceRing, {
+      value: sig.confidence,
+      label: sig.direction
+    })), /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: "flex",
+        gap: 8,
+        flexWrap: "wrap",
+        marginBottom: 16
+      }
+    }, /*#__PURE__*/React.createElement("span", {
+      style: s.badge(sig.direction === "BUY" ? "#10b981" : sig.direction === "SELL" ? "#ef4444" : "#64748b")
+    }, sig.direction), /*#__PURE__*/React.createElement("span", {
+      style: s.badge("#a78bfa")
+    }, sig.marketBias), /*#__PURE__*/React.createElement("span", {
+      style: s.badge(sig.risk === "Low" ? "#10b981" : sig.risk === "Medium" ? "#f59e0b" : "#ef4444")
+    }, "Risk: ", sig.risk)), /*#__PURE__*/React.createElement("div", {
+      style: {
+        marginBottom: 16
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 11,
+        color: "#64748b",
+        fontWeight: 600,
+        marginBottom: 8,
+        textTransform: "uppercase"
+      }
+    }, "Reasons"), sig.reasons.map((r, i) => /*#__PURE__*/React.createElement("div", {
+      key: i,
+      style: {
+        fontSize: 12,
+        color: "#94a3b8",
+        padding: "4px 0",
+        borderBottom: "1px solid #0f172a"
+      }
+    }, "✦ ", r))), /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: "grid",
+        gridTemplateColumns: "1fr 1fr",
+        gap: 10,
+        marginBottom: 16
+      }
+    }, [["RSI", sig.rsi], ["MACD Hist", sig.macd?.hist?.toFixed(5) ?? "—"], ["ATR", sig.atr], ["BB Width", sig.bb ? (sig.bb.upper - sig.bb.lower).toFixed(4) : "—"]].map(([k, v]) => /*#__PURE__*/React.createElement("div", {
+      key: k,
+      style: {
+        background: "#080d1a",
+        borderRadius: 8,
+        padding: "10px 12px"
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 10,
+        color: "#475569",
+        fontWeight: 600
+      }
+    }, k), /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontWeight: 700,
+        color: "#e2e8f0",
+        fontSize: 14
+      }
+    }, v)))), /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 11,
+        color: "#475569"
+      }
+    }, "Updated: ", sig.timestamp?.toLocaleTimeString())) : /*#__PURE__*/React.createElement("div", {
+      style: {
+        textAlign: "center",
+        color: "#475569",
+        padding: "40px 0"
+      }
+    }, "Click \"Analyze\" to generate signal for ", selectedMarket.label)), /*#__PURE__*/React.createElement("div", {
+      style: s.card
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontWeight: 700,
+        marginBottom: 16
+      }
+    }, "⚖️ Lot Size Calculator"), /*#__PURE__*/React.createElement("div", {
+      style: {
+        marginBottom: 12
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 11,
+        color: "#64748b",
+        fontWeight: 600,
+        marginBottom: 6
+      }
+    }, "Risk Mode"), /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: "flex",
+        gap: 8
+      }
+    }, ["conservative", "moderate", "aggressive"].map(m => /*#__PURE__*/React.createElement("button", {
+      key: m,
+      style: {
+        ...s.btn(m === riskMode ? "#6366f1" : "#334155", m !== riskMode),
+        flex: 1,
+        fontSize: 11,
+        padding: "7px 4px",
+        textTransform: "capitalize"
+      },
+      onClick: () => setRiskMode(m)
+    }, m, " (", RISK_MODES[m], "%)")))), lot && /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: "grid",
+        gridTemplateColumns: "1fr 1fr",
+        gap: 10,
+        marginBottom: 16
+      }
+    }, [["Lot Size", lot.lotSize], ["Max Risk", `$${lot.riskAmount}`], ["Stop Loss", lot.sl], ["Take Profit", lot.tp], ["Account", `$${bal.toFixed(2)}`], ["Risk %", `${RISK_MODES[riskMode]}%`]].map(([k, v]) => /*#__PURE__*/React.createElement("div", {
+      key: k,
+      style: {
+        background: "#080d1a",
+        borderRadius: 8,
+        padding: "10px 12px"
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 10,
+        color: "#475569",
+        fontWeight: 600
+      }
+    }, k), /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontWeight: 700,
+        color: "#e2e8f0"
+      }
+    }, v)))), /*#__PURE__*/React.createElement("div", {
+      style: {
+        marginBottom: 12
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 11,
+        color: "#64748b",
+        fontWeight: 600,
+        marginBottom: 6
+      }
+    }, "Execution Mode"), [["signal", "Signal Only – Alerts"], ["semi", "Semi-Auto – Confirm First"], ["auto", "Fully Automated"]].map(([id, label]) => /*#__PURE__*/React.createElement("div", {
+      key: id,
+      style: {
+        display: "flex",
+        alignItems: "center",
+        gap: 10,
+        padding: "8px 0",
+        borderBottom: "1px solid #0f172a",
+        cursor: "pointer"
+      },
+      onClick: () => setTradeMode(id)
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        width: 14,
+        height: 14,
+        borderRadius: "50%",
+        border: `2px solid #6366f1`,
+        background: tradeMode === id ? "#6366f1" : "transparent"
+      }
+    }), /*#__PURE__*/React.createElement("span", {
+      style: {
+        fontSize: 12
+      }
+    }, label)))), tradeMode === "auto" && /*#__PURE__*/React.createElement("button", {
+      style: s.btn(autoTrading ? "#ef4444" : "#10b981"),
+      onClick: () => setAutoTrading(v => !v)
+    }, autoTrading ? "🛑 Stop Auto-Trading" : "▶ Start Auto-Trading"), sig && sig.direction !== "WAIT" && /*#__PURE__*/React.createElement("button", {
+      style: {
+        ...s.btn(sig.direction === "BUY" ? "#10b981" : "#ef4444"),
+        marginTop: 10,
+        width: "100%"
+      },
+      onClick: () => handleSignalAction(selectedMarket, sig)
+    }, tradeMode === "signal" ? `📢 Alert Signal` : tradeMode === "semi" ? `⚡ Confirm & Trade` : `🤖 Auto Execute`)), sig && /*#__PURE__*/React.createElement("div", {
+      style: {
+        ...s.card,
+        gridColumn: "1 / -1"
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontWeight: 700,
+        marginBottom: 12
+      }
+    }, "🔬 Smart Money Concepts Analysis"), /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: "grid",
+        gridTemplateColumns: "repeat(4,1fr)",
+        gap: 10
+      }
+    }, [{
+      label: "BOS",
+      value: sig.smc?.bos ?? "None",
+      col: sig.smc?.bos === "bullish" ? "#10b981" : sig.smc?.bos === "bearish" ? "#ef4444" : "#475569"
+    }, {
+      label: "CHoCH",
+      value: sig.smc?.choch ?? "None",
+      col: sig.smc?.choch === "bullish" ? "#10b981" : "#475569"
+    }, {
+      label: "Order Blocks",
+      value: `${sig.smc?.orderBlocks?.length ?? 0} detected`,
+      col: "#6366f1"
+    }, {
+      label: "FVGs",
+      value: `${sig.smc?.fvgs?.length ?? 0} detected`,
+      col: "#f59e0b"
+    }].map(item => /*#__PURE__*/React.createElement("div", {
+      key: item.label,
+      style: {
+        background: "#080d1a",
+        borderRadius: 8,
+        padding: "12px 14px"
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 10,
+        color: "#475569",
+        fontWeight: 600,
+        marginBottom: 4
+      }
+    }, item.label), /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontWeight: 700,
+        color: item.col,
+        fontSize: 13,
+        textTransform: "capitalize"
+      }
+    }, item.value)))), /*#__PURE__*/React.createElement("div", {
+      style: {
+        marginTop: 16
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 11,
+        color: "#64748b",
+        fontWeight: 600,
+        marginBottom: 8
+      }
+    }, "TIMEFRAMES ANALYZED"), /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: "flex",
+        gap: 8
+      }
+    }, TIMEFRAMES.map(tf => /*#__PURE__*/React.createElement("span", {
+      key: tf,
+      style: s.badge("#6366f1")
+    }, tf))))));
+  })()), tab === "positions" && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontWeight: 700,
+      fontSize: 17,
+      marginBottom: 16
+    }
+  }, "📂 Open Positions"), openPos.length === 0 ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      ...s.card,
+      textAlign: "center",
+      color: "#475569",
+      padding: "60px 0"
+    }
+  }, "No open positions. Execute a trade from the Signals tab.") : /*#__PURE__*/React.createElement("div", {
+    style: s.card
+  }, /*#__PURE__*/React.createElement("table", {
+    style: {
+      width: "100%",
+      borderCollapse: "collapse",
+      fontSize: 12
+    }
+  }, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", {
+    style: {
+      borderBottom: "1px solid #1e293b"
+    }
+  }, ["Contract ID", "Market", "Type", "Stake", "Profit", "Status"].map(h => /*#__PURE__*/React.createElement("th", {
+    key: h,
+    style: {
+      padding: "8px 12px",
+      textAlign: "left",
+      color: "#475569",
+      fontWeight: 600,
+      fontSize: 11,
+      textTransform: "uppercase"
+    }
+  }, h)))), /*#__PURE__*/React.createElement("tbody", null, openPos.map(p => /*#__PURE__*/React.createElement("tr", {
+    key: p.contract_id,
+    style: {
+      borderBottom: "1px solid #0f172a"
+    }
+  }, /*#__PURE__*/React.createElement("td", {
+    style: {
+      padding: "10px 12px",
+      color: "#64748b"
+    }
+  }, p.contract_id), /*#__PURE__*/React.createElement("td", {
+    style: {
+      padding: "10px 12px"
+    }
+  }, p.underlying), /*#__PURE__*/React.createElement("td", {
+    style: {
+      padding: "10px 12px"
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: s.badge(p.contract_type === "CALL" ? "#10b981" : "#ef4444")
+  }, p.contract_type)), /*#__PURE__*/React.createElement("td", {
+    style: {
+      padding: "10px 12px"
+    }
+  }, "$", p.buy_price), /*#__PURE__*/React.createElement("td", {
+    style: {
+      padding: "10px 12px",
+      color: p.profit >= 0 ? "#10b981" : "#ef4444"
+    }
+  }, p.profit >= 0 ? "+" : "", p.profit?.toFixed(2) ?? "—"), /*#__PURE__*/React.createElement("td", {
+    style: {
+      padding: "10px 12px"
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: s.badge("#f59e0b")
+  }, p.status))))))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontWeight: 700,
+      fontSize: 17,
+      margin: "24px 0 16px"
+    }
+  }, "📜 Trade History"), tradeHistory.length === 0 ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      ...s.card,
+      textAlign: "center",
+      color: "#475569",
+      padding: "40px 0"
+    }
+  }, "No trade history available.") : /*#__PURE__*/React.createElement("div", {
+    style: s.card
+  }, /*#__PURE__*/React.createElement("table", {
+    style: {
+      width: "100%",
+      borderCollapse: "collapse",
+      fontSize: 12
+    }
+  }, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", {
+    style: {
+      borderBottom: "1px solid #1e293b"
+    }
+  }, ["Date", "Market", "Buy", "Sell", "P&L"].map(h => /*#__PURE__*/React.createElement("th", {
+    key: h,
+    style: {
+      padding: "8px 12px",
+      textAlign: "left",
+      color: "#475569",
+      fontWeight: 600,
+      fontSize: 11
+    }
+  }, h)))), /*#__PURE__*/React.createElement("tbody", null, tradeHistory.map((t, i) => {
+    const pnl = (t.sell_price || 0) - (t.buy_price || 0);
+    return /*#__PURE__*/React.createElement("tr", {
+      key: i,
+      style: {
+        borderBottom: "1px solid #0f172a"
+      }
+    }, /*#__PURE__*/React.createElement("td", {
+      style: {
+        padding: "8px 12px",
+        color: "#64748b"
+      }
+    }, t.sell_time ? new Date(t.sell_time * 1000).toLocaleDateString() : "—"), /*#__PURE__*/React.createElement("td", {
+      style: {
+        padding: "8px 12px"
+      }
+    }, t.shortcode?.split("_")[0] ?? "—"), /*#__PURE__*/React.createElement("td", {
+      style: {
+        padding: "8px 12px"
+      }
+    }, "$", t.buy_price?.toFixed(2)), /*#__PURE__*/React.createElement("td", {
+      style: {
+        padding: "8px 12px"
+      }
+    }, "$", t.sell_price?.toFixed(2)), /*#__PURE__*/React.createElement("td", {
+      style: {
+        padding: "8px 12px",
+        color: pnl >= 0 ? "#10b981" : "#ef4444",
+        fontWeight: 700
+      }
+    }, pnl >= 0 ? "+" : "", pnl.toFixed(2)));
+  }))))), tab === "journal" && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontWeight: 700,
+      fontSize: 17,
+      marginBottom: 16
+    }
+  }, "📓 Trade Journal"), journal.length === 0 ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      ...s.card,
+      textAlign: "center",
+      color: "#475569",
+      padding: "60px 0"
+    }
+  }, "No journal entries yet. Execute trades to start tracking.") : journal.map((e, i) => /*#__PURE__*/React.createElement("div", {
+    key: i,
+    style: {
+      ...s.card,
+      display: "flex",
+      alignItems: "center",
+      gap: 16
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: s.badge(e.direction === "BUY" ? "#10b981" : "#ef4444")
+  }, e.direction), /*#__PURE__*/React.createElement("div", {
+    style: {
+      flex: 1
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontWeight: 600
+    }
+  }, e.market), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: "#475569"
+    }
+  }, new Date(e.time).toLocaleString())), /*#__PURE__*/React.createElement("div", {
+    style: {
+      textAlign: "right"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: "#94a3b8"
+    }
+  }, "Lot ", e.lot), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: "#6366f1"
+    }
+  }, e.confidence, "% confidence")), /*#__PURE__*/React.createElement("span", {
+    style: s.badge("#f59e0b")
+  }, e.status)))), tab === "analytics" && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontWeight: 700,
+      fontSize: 17,
+      marginBottom: 16
+    }
+  }, "📈 Performance Analytics"), /*#__PURE__*/React.createElement("div", {
+    style: s.row
+  }, [{
+    label: "Win Rate",
+    value: `${winRate}%`,
+    col: "#10b981"
+  }, {
+    label: "Total Trades",
+    value: tradeHistory.length,
+    col: "#6366f1"
+  }, {
+    label: "Consecutive Losses",
+    value: lossSeries,
+    col: "#ef4444"
+  }, {
+    label: "Auto Trades",
+    value: journal.length,
+    col: "#f59e0b"
+  }].map(item => /*#__PURE__*/React.createElement("div", {
+    key: item.label,
+    style: s.stat(item.col)
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: "#64748b",
+      fontWeight: 600,
+      marginBottom: 8
+    }
+  }, item.label), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 26,
+      fontWeight: 800,
+      color: item.col
+    }
+  }, item.value)))), /*#__PURE__*/React.createElement("div", {
+    style: s.card
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontWeight: 700,
+      marginBottom: 12
+    }
+  }, "Equity Curve"), equityCurve.length > 1 ? /*#__PURE__*/React.createElement(Sparkline, {
+    data: equityCurve,
+    color: "#6366f1"
+  }) : /*#__PURE__*/React.createElement("div", {
+    style: {
+      color: "#475569",
+      fontSize: 12,
+      padding: "30px 0"
+    }
+  }, "No equity data yet.")), /*#__PURE__*/React.createElement("div", {
+    style: s.card
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontWeight: 700,
+      marginBottom: 12
+    }
+  }, "Risk Management Status"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gridTemplateColumns: "1fr 1fr",
+      gap: 12
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      background: "#080d1a",
+      borderRadius: 8,
+      padding: "14px"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: "#64748b",
+      marginBottom: 6
+    }
+  }, "Daily Loss Guard"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 13,
+      color: lossSeries >= 3 ? "#ef4444" : "#10b981",
+      fontWeight: 700
+    }
+  }, lossSeries >= 3 ? "🛑 HALTED – 3 consecutive losses" : `✅ Active – ${3 - lossSeries} loss${3 - lossSeries !== 1 ? "es" : ""} remaining`)), /*#__PURE__*/React.createElement("div", {
+    style: {
+      background: "#080d1a",
+      borderRadius: 8,
+      padding: "14px"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: "#64748b",
+      marginBottom: 6
+    }
+  }, "Auto-Trading"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 13,
+      color: autoTrading ? "#10b981" : "#475569",
+      fontWeight: 700
+    }
+  }, autoTrading ? "🤖 Running" : "⏸ Off")))), /*#__PURE__*/React.createElement("div", {
+    style: s.card
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontWeight: 700,
+      marginBottom: 12
+    }
+  }, "Signal Confidence Distribution"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 6,
+      alignItems: "flex-end",
+      height: 80
+    }
+  }, MARKETS.map(m => {
+    const sig = signals[m.id];
+    const conf = sig?.confidence ?? 0;
+    return /*#__PURE__*/React.createElement("div", {
+      key: m.id,
+      style: {
+        flex: 1,
+        display: "flex",
+        flexDirection: "column",
+        alignItems: "center",
+        gap: 4
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        width: "100%",
+        background: m.color,
+        borderRadius: "3px 3px 0 0",
+        height: `${conf}%`,
+        maxHeight: "100%"
+      }
+    }), /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 9,
+        color: "#475569",
+        textAlign: "center"
+      }
+    }, m.label.split(" ").pop()));
+  })))), tab === "settings" && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontWeight: 700,
+      fontSize: 17,
+      marginBottom: 16
+    }
+  }, "⚙ Settings"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gridTemplateColumns: "1fr 1fr",
+      gap: 16
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: s.card
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontWeight: 700,
+      marginBottom: 14
+    }
+  }, "Account"), [["Login ID", account?.loginid], ["Account Type", account?.account_type], ["Currency", account?.currency], ["Balance", `${account?.currency} ${balance?.toFixed(2) ?? "—"}`], ["Country", account?.country]].map(([k, v]) => /*#__PURE__*/React.createElement("div", {
+    key: k,
+    style: {
+      display: "flex",
+      justifyContent: "space-between",
+      padding: "8px 0",
+      borderBottom: "1px solid #0f172a",
+      fontSize: 13
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: "#64748b"
+    }
+  }, k), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontWeight: 600
+    }
+  }, v ?? "—"))), /*#__PURE__*/React.createElement("button", {
+    style: {
+      ...s.btn("#ef4444", true),
+      marginTop: 16,
+      width: "100%"
+    },
+    onClick: disconnect
+  }, "Disconnect Account")), /*#__PURE__*/React.createElement("div", {
+    style: s.card
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontWeight: 700,
+      marginBottom: 14
+    }
+  }, "Risk Configuration"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginBottom: 14
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: "#64748b",
+      marginBottom: 6
+    }
+  }, "Default Risk Mode"), ["conservative", "moderate", "aggressive"].map(m => /*#__PURE__*/React.createElement("div", {
+    key: m,
+    style: {
+      display: "flex",
+      alignItems: "center",
+      gap: 10,
+      padding: "8px 0",
+      cursor: "pointer"
+    },
+    onClick: () => setRiskMode(m)
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      width: 14,
+      height: 14,
+      borderRadius: "50%",
+      border: `2px solid #6366f1`,
+      background: riskMode === m ? "#6366f1" : "transparent"
+    }
+  }), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 13,
+      textTransform: "capitalize"
+    }
+  }, m, " – ", RISK_MODES[m], "% per trade")))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      padding: "10px 14px",
+      background: "#080d1a",
+      borderRadius: 8,
+      fontSize: 12,
+      color: "#64748b"
+    }
+  }, "Daily halt after ", /*#__PURE__*/React.createElement("strong", {
+    style: {
+      color: "#e2e8f0"
+    }
+  }, "3"), " consecutive losses or ", /*#__PURE__*/React.createElement("strong", {
+    style: {
+      color: "#e2e8f0"
+    }
+  }, "5%"), " drawdown.")), /*#__PURE__*/React.createElement("div", {
+    style: s.card
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontWeight: 700,
+      marginBottom: 14
+    }
+  }, "Execution Mode"), [["signal", "Signal Only", "Alerts & analysis only, no trades."], ["semi", "Semi-Automatic", "Shows confirmation dialog before each trade."], ["auto", "Fully Automated", "Executes all high-confidence signals automatically."]].map(([id, label, desc]) => /*#__PURE__*/React.createElement("div", {
+    key: id,
+    style: {
+      padding: "12px 0",
+      borderBottom: "1px solid #0f172a",
+      cursor: "pointer"
+    },
+    onClick: () => setTradeMode(id)
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      alignItems: "center",
+      gap: 10,
+      marginBottom: 4
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      width: 14,
+      height: 14,
+      borderRadius: "50%",
+      border: `2px solid #6366f1`,
+      background: tradeMode === id ? "#6366f1" : "transparent"
+    }
+  }), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 13,
+      fontWeight: 600
+    }
+  }, label)), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: "#475569",
+      paddingLeft: 24
+    }
+  }, desc)))), /*#__PURE__*/React.createElement("div", {
+    style: s.card
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontWeight: 700,
+      marginBottom: 14
+    }
+  }, "Markets"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: "#64748b",
+      marginBottom: 12
+    }
+  }, "All markets active. Click to toggle."), MARKETS.map(m => /*#__PURE__*/React.createElement("div", {
+    key: m.id,
+    style: {
+      display: "flex",
+      justifyContent: "space-between",
+      padding: "6px 0",
+      borderBottom: "1px solid #0f172a",
+      fontSize: 12
+    }
+  }, /*#__PURE__*/React.createElement("span", null, m.label), /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: m.color
+    }
+  }, "● Active"))))))));
+}
+
+
+  const root = ReactDOM.createRoot(document.getElementById("root"));
+  root.render(React.createElement(DerivAITrader));
+})();
+  </script>
+</body>
+</html>
