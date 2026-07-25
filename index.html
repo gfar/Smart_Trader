@@ -143,6 +143,8 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); ou
       Paste your Deriv Personal Access Token (the <span class="mono">pat_...</span> one from Settings → API token) to start analyzing Boom, Crash, and Volatility indices.
       This page talks directly to Deriv's API from your browser — your token is never sent anywhere but Deriv, and disappears when you close or refresh this tab.
     </p>
+    <label for="app-id-input">App ID</label>
+    <input id="app-id-input" type="text" class="mono" placeholder="Your registered App ID from developers.deriv.com" style="width:100%; background:var(--bg); border:1px solid var(--border); border-radius:var(--radius); padding:11px 12px; color:var(--text); font-size:14px; margin-bottom:16px;" />
     <label for="token-input">API token</label>
     <div style="position:relative;">
       <input id="token-input" type="password" class="mono" placeholder="Paste your Deriv API token" autofocus autocomplete="off" data-lpignore="true" style="padding-right:60px;" />
@@ -545,8 +547,7 @@ class DerivClient {
       }, 15000);
     });
   }
-  async connect(token) {
-    const appId = "1089";
+  async connect(token, appId) {
     const headers = { "Deriv-App-ID": appId, "Authorization": "Bearer " + token };
 
     // Step 1: list the accounts this PAT can access
@@ -670,12 +671,14 @@ el("token-input").addEventListener("input", () => {
 
 el("connect-btn").addEventListener("click", async () => {
   const token = cleanToken(el("token-input").value);
+  const appId = el("app-id-input").value.trim();
   if (!token) return;
+  if (!appId) { showConnectError("Enter your App ID from developers.deriv.com first."); return; }
   el("connect-error").classList.add("hidden");
   el("connect-btn").disabled = true;
   el("connect-btn").textContent = "Connecting…";
   try {
-    const account = await client.connect(token);
+    const account = await client.connect(token, appId);
     el("account-pill").textContent = account.loginid + " · " + account.balance + " " + account.currency + (account.is_virtual ? " · DEMO" : " · LIVE");
     el("connect-screen").classList.add("hidden");
     el("app").classList.remove("hidden");
